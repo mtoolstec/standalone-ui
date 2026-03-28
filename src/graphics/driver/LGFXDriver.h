@@ -7,6 +7,7 @@
 #include "lvgl_private.h"
 #include "util/ILog.h"
 #include <functional>
+#include <vector>
 
 #ifdef TAB5_MUI
 #include <M5GFX.h>
@@ -95,15 +96,40 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
 {
 #ifdef TAB5_MUI
     bool touchWake = false;
+    int pin_int = -1;
     if (hasTouch()) {
         uint16_t touchX = 0;
         uint16_t touchY = 0;
         touchWake = lgfx->getTouch(&touchX, &touchY);
+#ifndef CUSTOM_TOUCH_DRIVER
+        pin_int = lgfx->touch()->config().pin_int;
+#else
+        pin_int = lgfx->getTouchInt();
+#endif
     }
+
+    const bool irqWake = false;
+    const bool recentActivityWake = (lv_display_get_inactive_time(NULL) < 150);
+    const bool wakeRequested = touchWake || irqWake || recentActivityWake;
+    const uint8_t restoreBrightness = lastBrightness > 0 ? static_cast<uint8_t>(lastBrightness) : defaultBrightness;
 
     if ((screenTimeout > 0 && lv_display_get_inactive_time(NULL) > screenTimeout) || powerSaving ||
         (DisplayDriver::view->isScreenLocked())) {
         if (hasLight()) {
+            if (!powerSaving && wakeRequested && lgfx->getBrightness() == 0 && !DisplayDriver::view->isScreenLocked()) {
+                ILOG_INFO("tab5 backlight forced wake");
+                DisplayDriver::view->triggerHeartbeat();
+                lgfx->powerSaveOff();
+                lgfx->wakeup();
+                lgfx->setBrightness(255);
+                delay(2);
+                lgfx->setBrightness(restoreBrightness);
+                ILOG_INFO("tab5 backlight restore(forced): target=%u actual=%u", static_cast<unsigned>(restoreBrightness),
+                          static_cast<unsigned>(lgfx->getBrightness()));
+                DisplayDriver::view->screenSaving(false);
+                lv_display_trigger_activity(NULL);
+            }
+
             if (!powerSaving) {
                 uint32_t brightness = lgfx->getBrightness();
                 if (brightness > 0) {
@@ -115,22 +141,29 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
                 }
             }
 
-            if (powerSaving && (touchWake || (screenTimeout + 50 > lv_display_get_inactive_time(NULL)))) {
+            if (powerSaving && wakeRequested) {
                 ILOG_INFO("leave tab5 backlight save");
                 powerSaving = false;
                 DisplayDriver::view->triggerHeartbeat();
-                lgfx->setBrightness(lastBrightness);
+                lgfx->powerSaveOff();
+                lgfx->wakeup();
+                lgfx->setBrightness(255);
+                delay(2);
+                lgfx->setBrightness(restoreBrightness);
+                ILOG_INFO("tab5 backlight restore: target=%u actual=%u", static_cast<unsigned>(restoreBrightness),
+                          static_cast<unsigned>(lgfx->getBrightness()));
                 DisplayDriver::view->screenSaving(false);
                 lv_display_trigger_activity(NULL);
             }
         }
-    } else if (lgfx->getBrightness() < lastBrightness) {
-        lgfx->setBrightness(lastBrightness);
+    } else if (lgfx->getBrightness() < restoreBrightness) {
+        lgfx->setBrightness(restoreBrightness);
     }
 
     if (!calibrating) {
         DisplayDriver::task_handler();
     }
+
     return;
 #endif
 
@@ -178,7 +211,7 @@ template <class LGFX> void LGFXDriver<LGFX>::task_handler(void)
 #endif
                     }
                     if (touched || (pin_int >= 0 && DisplayDriver::view->sleep(pin_int)) ||
-                        (screenTimeout + 50 > lv_display_get_inactive_time(NULL) && !DisplayDriver::view->isScreenLocked())) {
+                        (lv_display_get_inactive_time(NULL) < 150 && !DisplayDriver::view->isScreenLocked())) {
                         delay(2);
                         ILOG_INFO("leaving powersave");
                         powerSaving = false;
@@ -228,29 +261,60 @@ template <class LGFX> void LGFXDriver<LGFX>::display_flush(lv_display_t *disp, c
     lv_draw_sw_rgb565_swap(px_map, w * h);
 
 #ifdef TAB5_MUI
-    auto &tab5Canvas = getTab5Canvas<LGFX>();
-    if (tab5Canvas == nullptr) {
-        lv_display_flush_ready(disp);
-        return;
-    }
+    if (lgfx->scale > 1 && lgfx->scaleX == lgfx->scale && lgfx->scaleY == lgfx->scale) {
+        const uint16_t scale = lgfx->scale;
+        const int32_t dstX = lgfx->offsetX + area->x1 * scale;
+        const int32_t dstY = lgfx->offsetY + area->y1 * scale;
+        const size_t scaledW = w * scale;
+        static std::vector<uint16_t> scaledRow;
+        if (scaledRow.size() < scaledW) {
+            scaledRow.resize(scaledW);
+        }
 
-    tab5Canvas->pushImage(area->x1, area->y1, w, h, reinterpret_cast<uint16_t *>(px_map));
+        auto *src = reinterpret_cast<uint16_t *>(px_map);
+        lgfx->startWrite();
+        for (uint32_t row = 0; row < h; ++row) {
+            const uint16_t *srcRow = src + row * w;
+            size_t out = 0;
+            for (uint32_t col = 0; col < w; ++col) {
+                const uint16_t pixel = srcRow[col];
+                for (uint16_t copy = 0; copy < scale; ++copy) {
+                    scaledRow[out++] = pixel;
+                }
+            }
 
-    if (!lv_display_flush_is_last(disp)) {
-        lv_display_flush_ready(disp);
-        return;
-    }
+            const int32_t physicalY = dstY + row * scale;
+            for (uint16_t copyRow = 0; copyRow < scale; ++copyRow) {
+                lgfx->pushImage(dstX, physicalY + copyRow, scaledW, 1, scaledRow.data());
+            }
+        }
+        lgfx->endWrite();
+    } else {
+        auto &tab5Canvas = getTab5Canvas<LGFX>();
+        if (tab5Canvas == nullptr) {
+            lv_display_flush_ready(disp);
+            return;
+        }
 
-    lgfx->startWrite();
-    if (lgfx->offsetX > 0) {
-        lgfx->fillRect(0, 0, lgfx->offsetX, lgfx->physicalHeight, LGFX::color565(0x11, 0x16, 0x1A));
-        lgfx->fillRect(lgfx->offsetX + lgfx->scaledWidth, 0, lgfx->physicalWidth - (lgfx->offsetX + lgfx->scaledWidth),
-                       lgfx->physicalHeight, LGFX::color565(0x11, 0x16, 0x1A));
-        lgfx->drawFastVLine(lgfx->offsetX, 0, lgfx->physicalHeight, LGFX::color565(0x3D, 0xDA, 0x83));
-        lgfx->drawFastVLine(lgfx->offsetX + lgfx->scaledWidth, 0, lgfx->physicalHeight, LGFX::color565(0x3D, 0xDA, 0x83));
+        tab5Canvas->pushImage(area->x1, area->y1, w, h, reinterpret_cast<uint16_t *>(px_map));
+
+        if (!lv_display_flush_is_last(disp)) {
+            lv_display_flush_ready(disp);
+            return;
+        }
+
+        lgfx->startWrite();
+        if (lgfx->offsetX > 0) {
+            lgfx->fillRect(0, 0, lgfx->offsetX, lgfx->physicalHeight, LGFX::color565(0x11, 0x16, 0x1A));
+            lgfx->fillRect(lgfx->offsetX + lgfx->scaledWidth, 0,
+                           lgfx->physicalWidth - (lgfx->offsetX + lgfx->scaledWidth), lgfx->physicalHeight,
+                           LGFX::color565(0x11, 0x16, 0x1A));
+            lgfx->drawFastVLine(lgfx->offsetX, 0, lgfx->physicalHeight, LGFX::color565(0x3D, 0xDA, 0x83));
+            lgfx->drawFastVLine(lgfx->offsetX + lgfx->scaledWidth, 0, lgfx->physicalHeight, LGFX::color565(0x3D, 0xDA, 0x83));
+        }
+        tab5Canvas->pushRotateZoom(lgfx, lgfx->offsetX, lgfx->offsetY, 0.0f, lgfx->scaleX, lgfx->scaleY);
+        lgfx->endWrite();
     }
-    tab5Canvas->pushRotateZoom(lgfx, lgfx->offsetX, lgfx->offsetY, 0.0f, lgfx->scaleX, lgfx->scaleY);
-    lgfx->endWrite();
 #else
     lgfx->pushImage(area->x1, area->y1, w, h, reinterpret_cast<uint16_t *>(px_map));
 #endif
@@ -390,7 +454,7 @@ template <class LGFX> void LGFXDriver<LGFX>::init_lgfx(void)
 
 #ifdef TAB5_MUI
     auto &tab5Canvas = getTab5Canvas<LGFX>();
-    if (tab5Canvas == nullptr || tab5Canvas->width() != lgfx->screenWidth || tab5Canvas->height() != lgfx->screenHeight) {
+    if (lgfx->scale <= 1 && (tab5Canvas == nullptr || tab5Canvas->width() != lgfx->screenWidth || tab5Canvas->height() != lgfx->screenHeight)) {
         if (tab5Canvas != nullptr) {
             tab5Canvas->deleteSprite();
             delete tab5Canvas;
@@ -400,8 +464,15 @@ template <class LGFX> void LGFXDriver<LGFX>::init_lgfx(void)
         tab5Canvas->setColorDepth(16);
         tab5Canvas->createSprite(lgfx->screenWidth, lgfx->screenHeight);
         tab5Canvas->setPivot(0, 0);
+        tab5Canvas->fillScreen(LGFX::color565(0x3D, 0xDA, 0x83));
     }
-    tab5Canvas->fillScreen(LGFX::color565(0x3D, 0xDA, 0x83));
+    if (lgfx->offsetX > 0) {
+        lgfx->fillRect(0, 0, lgfx->offsetX, lgfx->physicalHeight, LGFX::color565(0x11, 0x16, 0x1A));
+        lgfx->fillRect(lgfx->offsetX + lgfx->scaledWidth, 0, lgfx->physicalWidth - (lgfx->offsetX + lgfx->scaledWidth),
+                       lgfx->physicalHeight, LGFX::color565(0x11, 0x16, 0x1A));
+        lgfx->drawFastVLine(lgfx->offsetX, 0, lgfx->physicalHeight, LGFX::color565(0x3D, 0xDA, 0x83));
+        lgfx->drawFastVLine(lgfx->offsetX + lgfx->scaledWidth, 0, lgfx->physicalHeight, LGFX::color565(0x3D, 0xDA, 0x83));
+    }
     ILOG_INFO("Tab5 display rotated to landscape: physical=%ux%u scale=%u offset=(%u,%u)", lgfx->physicalWidth,
               lgfx->physicalHeight, lgfx->scale, lgfx->offsetX, lgfx->offsetY);
 #endif
@@ -472,18 +543,8 @@ template <class LGFX> bool LGFXDriver<LGFX>::calibrate(uint16_t parameters[8])
 template <class LGFX> void LGFXDriver<LGFX>::setBrightness(uint8_t brightness)
 {
 #ifdef TAB5_MUI
-    // UI brightness is percentage-like (0..100). Map non-linearly for better low-light behavior.
-    uint8_t hwBrightness = brightness;
-    if (brightness <= 100) {
-        if (brightness <= 1) {
-            hwBrightness = 0;
-        } else {
-            uint32_t mapped = static_cast<uint32_t>(brightness) * static_cast<uint32_t>(brightness) * 255U / 10000U;
-            hwBrightness = mapped > 0 ? static_cast<uint8_t>(mapped) : 1;
-        }
-    }
-    lgfx->setBrightness(hwBrightness);
-    lastBrightness = hwBrightness;
+    lgfx->setBrightness(brightness);
+    lastBrightness = brightness;
 #else
     lgfx->setBrightness(brightness);
     lastBrightness = brightness;

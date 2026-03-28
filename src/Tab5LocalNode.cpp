@@ -36,6 +36,14 @@ constexpr uint8_t kLoRaIrq = 6;
 constexpr int8_t kLoRaRst = -1;
 constexpr uint8_t kLoRaBusy = 46;
 constexpr uint8_t kLoRaRfSwitch = 14;
+constexpr uint8_t kRfSwitchRxLevel = HIGH;
+constexpr uint8_t kRfSwitchTxLevel = LOW;
+constexpr bool kEnableRfPathSweepTx = false;
+constexpr bool kEnableDualRfSwitchTxProbe = false;
+constexpr bool kPrimaryRfUsesDio2AutoSwitch = true;
+constexpr bool kFallbackRfUsesDio2AutoSwitch = false;
+constexpr bool kEnableAltHashCompatTx = false;
+constexpr int8_t kMaxTab5TxPowerDbm = 22;
 
 constexpr float kDefaultFrequencyMhz = 868.0f;
 constexpr float kDefaultBandwidthKhz = 125.0f;
@@ -43,7 +51,7 @@ constexpr uint8_t kDefaultSpreadFactor = 12;
 constexpr uint8_t kDefaultCodingRate = 8;
 constexpr uint8_t kDefaultSyncWord = 0x2B;
 constexpr int8_t kDefaultTxPowerDbm = 22;
-constexpr uint8_t kDefaultPreamble = 20;
+constexpr uint8_t kDefaultPreamble = 16;
 
 constexpr uint32_t kFallbackLocalNodeNum = 0x0A0B0C0D;
 constexpr char kLongNamePrefix[] = "Tab5L";
@@ -67,8 +75,12 @@ constexpr uint8_t kPacketFlagsWantAckMask = 0x08;
 constexpr uint8_t kPacketFlagsViaMqttMask = 0x10;
 constexpr uint8_t kPacketFlagsHopStartMask = 0xE0;
 constexpr uint8_t kPacketFlagsHopStartShift = 5;
+constexpr uint8_t kBitfieldOkToMqttMask = 1u << 0;
+constexpr uint8_t kBitfieldWantResponseMask = 1u << 1;
+constexpr bool kEnableRawTxProbe = false;
 
 volatile bool gRadioRxPending = false;
+volatile bool gRadioTxDonePending = false;
 
 #pragma pack(push, 1)
 struct PacketHeader {
@@ -97,6 +109,88 @@ uint8_t xorHash(const uint8_t *data, size_t len)
         hash ^= data[i];
     }
     return hash;
+}
+
+void logHexDump(const char *prefix, const uint8_t *data, size_t len)
+{
+    if (!prefix) {
+        prefix = "HEX";
+    }
+
+    if (!data || len == 0) {
+        ILOG_INFO("%s hex: <empty>", prefix);
+        return;
+    }
+
+    char line[96] = {0};
+    for (size_t offset = 0; offset < len; offset += 16) {
+        const size_t chunkLen = std::min<size_t>(16, len - offset);
+        size_t pos = static_cast<size_t>(std::snprintf(line, sizeof(line), "%s hex [%03u]:", prefix,
+                                                       static_cast<unsigned>(offset)));
+        for (size_t i = 0; i < chunkLen && pos + 4 < sizeof(line); ++i) {
+            pos += static_cast<size_t>(std::snprintf(line + pos, sizeof(line) - pos, " %02X", data[offset + i]));
+        }
+        ILOG_INFO("%s", line);
+    }
+}
+
+bool tryGetPresetRadioParameters(meshtastic_Config_LoRaConfig_ModemPreset preset, float &bandwidthKhz, uint8_t &spreadFactor,
+                                 uint8_t &codingRate)
+{
+    switch (preset) {
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST:
+        bandwidthKhz = 250.0f;
+        spreadFactor = 11;
+        codingRate = 5;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW:
+        bandwidthKhz = 125.0f;
+        spreadFactor = 12;
+        codingRate = 8;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_VERY_LONG_SLOW:
+        bandwidthKhz = 62.0f;
+        spreadFactor = 12;
+        codingRate = 8;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_SLOW:
+        bandwidthKhz = 250.0f;
+        spreadFactor = 10;
+        codingRate = 7;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST:
+        bandwidthKhz = 250.0f;
+        spreadFactor = 9;
+        codingRate = 5;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW:
+        bandwidthKhz = 250.0f;
+        spreadFactor = 8;
+        codingRate = 5;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST:
+        bandwidthKhz = 250.0f;
+        spreadFactor = 7;
+        codingRate = 5;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_MODERATE:
+        bandwidthKhz = 125.0f;
+        spreadFactor = 11;
+        codingRate = 8;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO:
+        bandwidthKhz = 500.0f;
+        spreadFactor = 7;
+        codingRate = 5;
+        return true;
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_TURBO:
+        bandwidthKhz = 500.0f;
+        spreadFactor = 11;
+        codingRate = 5;
+        return true;
+    default:
+        return false;
+    }
 }
 
 uint32_t localNodeNum();
@@ -136,6 +230,41 @@ bool cryptAesCtr(const uint8_t *key, size_t keyLength, uint32_t fromNode, uint64
     return cryptRc == 0;
 }
 
+bool applyPacketLayerDefaults(SX1262 &radio, int8_t txPowerDbm)
+{
+    int state = radio.setOutputPower(txPowerDbm);
+    if (state != RADIOLIB_ERR_NONE) {
+        ILOG_WARN("SX1262 setOutputPower failed: %d", state);
+        return false;
+    }
+
+    state = radio.setCurrentLimit(140);
+    if (state != RADIOLIB_ERR_NONE) {
+        ILOG_WARN("SX1262 setCurrentLimit failed: %d", state);
+        return false;
+    }
+
+    state = radio.setPreambleLength(kDefaultPreamble);
+    if (state != RADIOLIB_ERR_NONE) {
+        ILOG_WARN("SX1262 setPreambleLength failed: %d", state);
+        return false;
+    }
+
+    state = radio.setSyncWord(kDefaultSyncWord);
+    if (state != RADIOLIB_ERR_NONE) {
+        ILOG_WARN("SX1262 setSyncWord failed: %d", state);
+        return false;
+    }
+
+    state = radio.setCRC(2);
+    if (state != RADIOLIB_ERR_NONE) {
+        ILOG_WARN("SX1262 setCRC failed: %d", state);
+        return false;
+    }
+
+    return true;
+}
+
 void generateLocalNames(char *shortName, size_t shortNameSize, char *longName, size_t longNameSize)
 {
     char generatedShort[5] = {0};
@@ -171,7 +300,7 @@ uint32_t localNodeNum()
 
 void buildNodeId(char *out, size_t outSize)
 {
-    std::snprintf(out, outSize, "!%08lx", static_cast<unsigned long>(localNodeNum()));
+    std::snprintf(out, outSize, "!%08lX", static_cast<unsigned long>(localNodeNum()));
 }
 
 struct PersistedStateHeader {
@@ -221,6 +350,11 @@ void onRadioReceive()
     gRadioRxPending = true;
 }
 
+void onRadioTransmitDone()
+{
+    gRadioTxDonePending = true;
+}
+
 class Tab5StandaloneClient final : public PacketClient
 {
   public:
@@ -233,6 +367,54 @@ struct KnownNode {
     uint32_t lastHeard = 0;
     float snr = 0.0f;
 };
+
+struct RecentAirPacket {
+    uint32_t from = 0;
+    uint32_t id = 0;
+    uint32_t seenAtMs = 0;
+};
+
+struct PendingAckTx {
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_default;
+    uint8_t retriesDone = 0;
+    uint32_t lastSendMs = 0;
+};
+
+enum class RfPathMode {
+    AutoHigh,
+    ManualHigh,
+    ManualLow,
+};
+
+constexpr uint32_t kReliableRetryIntervalMs = 1500;
+constexpr uint8_t kReliableMaxRetries = 3;
+constexpr uint32_t kInteractiveNodeInfoMinIntervalMs = 60000;
+
+const char *portNumName(meshtastic_PortNum portnum)
+{
+    switch (portnum) {
+    case meshtastic_PortNum_TEXT_MESSAGE_APP:
+        return "TEXT";
+    case meshtastic_PortNum_ROUTING_APP:
+        return "ROUTING";
+    case meshtastic_PortNum_ADMIN_APP:
+        return "ADMIN";
+    case meshtastic_PortNum_NODEINFO_APP:
+        return "NODEINFO";
+    case meshtastic_PortNum_POSITION_APP:
+        return "POSITION";
+    case meshtastic_PortNum_TELEMETRY_APP:
+        return "TELEMETRY";
+    case meshtastic_PortNum_TRACEROUTE_APP:
+        return "TRACEROUTE";
+    case meshtastic_PortNum_NEIGHBORINFO_APP:
+        return "NEIGHBOR";
+    case meshtastic_PortNum_RANGE_TEST_APP:
+        return "RANGE";
+    default:
+        return "OTHER";
+    }
+}
 
 enum class PendingSystemAction {
     None,
@@ -269,9 +451,11 @@ class Tab5LocalNodeImpl
             return false;
         }
 
-        radio.setOutputPower(kDefaultTxPowerDbm);
-        radio.setCurrentLimit(140);
-        radio.setDio2AsRfSwitch(true);
+        if (!applyPacketLayerDefaults(radio, effectiveTxPowerDbm())) {
+            ILOG_ERROR("SX1262 packet layer init failed");
+            return false;
+        }
+        applyRfStrategy(kPrimaryRfUsesDio2AutoSwitch, false);
         radio.setPacketReceivedAction(onRadioReceive);
         state = radio.startReceive();
         if (state != RADIOLIB_ERR_NONE) {
@@ -279,8 +463,13 @@ class Tab5LocalNodeImpl
             return false;
         }
 
+        ILOG_INFO("SX1262 started: sync=0x%02x preamble=%u defaultFreq=%.4fMHz defaultBw=%.1fkHz defaultSf=%u defaultCr=%u txPower=%d",
+                  kDefaultSyncWord, kDefaultPreamble, kDefaultFrequencyMhz, kDefaultBandwidthKhz, kDefaultSpreadFactor,
+                  kDefaultCodingRate, kDefaultTxPowerDbm);
+
         started = true;
         applyLoRaConfigToRadio();
+        broadcastLocalNodeInfo("boot");
         return true;
     }
 
@@ -289,6 +478,9 @@ class Tab5LocalNodeImpl
         if (!started) {
             return;
         }
+
+        maybeBroadcastLocalNodeInfo();
+        processPendingAckRetries();
 
         runPendingSystemAction();
 
@@ -433,7 +625,26 @@ class Tab5LocalNodeImpl
         if (primary.settings.name[0] != '\0') {
             return primary.settings.name;
         }
-        return LoRaPresets::modemPresetToString(loraConfig.modem_preset);
+        if (loraConfig.use_preset) {
+            return LoRaPresets::modemPresetToString(loraConfig.modem_preset);
+        }
+        return "Custom";
+    }
+
+    const char *hashPrimaryChannelName() const
+    {
+        const auto &primary = activePrimaryChannel();
+        // Official Meshtastic hashes an unnamed default preset channel using the
+        // derived preset display name (for example LongFast), not an empty string.
+        if (loraConfig.use_preset) {
+            const char *presetName = LoRaPresets::modemPresetToString(loraConfig.modem_preset);
+            if (primary.settings.name[0] == '\0') {
+                return presetName;
+            }
+        }
+
+        // Explicit channel names hash exactly as stored on the channel.
+        return primary.settings.name;
     }
 
     ExpandedChannelKey expandedPrimaryKey() const
@@ -479,13 +690,22 @@ class Tab5LocalNodeImpl
     uint8_t primaryChannelHash() const
     {
         const ExpandedChannelKey key = expandedPrimaryKey();
-        return xorHash(reinterpret_cast<const uint8_t *>(effectivePrimaryChannelName()), std::strlen(effectivePrimaryChannelName())) ^
+        return xorHash(reinterpret_cast<const uint8_t *>(hashPrimaryChannelName()), std::strlen(hashPrimaryChannelName())) ^
                xorHash(key.bytes, key.length);
     }
 
     uint8_t currentAirChannelHash() const
     {
-        return hasLearnedChannelHash ? learnedChannelHash : primaryChannelHash();
+        // Always transmit with the local channel hash. Learned hashes are kept
+        // for diagnostics only and must not steer TX onto a foreign network.
+        return primaryChannelHash();
+    }
+
+    uint8_t legacyPresetNameChannelHash() const
+    {
+        const ExpandedChannelKey key = expandedPrimaryKey();
+        return xorHash(reinterpret_cast<const uint8_t *>(effectivePrimaryChannelName()), std::strlen(effectivePrimaryChannelName())) ^
+               xorHash(key.bytes, key.length);
     }
 
     uint32_t effectiveChannelNum() const
@@ -501,6 +721,90 @@ class Tab5LocalNodeImpl
         return LoRaPresets::getDefaultSlot(loraConfig.region, loraConfig.modem_preset, effectivePrimaryChannelName());
     }
 
+    void computeActiveRadioParameters(float &frequency, float &bandwidthKhz, uint8_t &spreadFactor, uint8_t &codingRate,
+                                      uint32_t &channelNum) const
+    {
+        frequency = kDefaultFrequencyMhz;
+        bandwidthKhz = kDefaultBandwidthKhz;
+        spreadFactor = kDefaultSpreadFactor;
+        codingRate = kDefaultCodingRate;
+        channelNum = effectiveChannelNum();
+
+        if (loraConfig.use_preset) {
+            uint32_t numChannels = LoRaPresets::getNumChannels(loraConfig.region, loraConfig.modem_preset);
+            if (numChannels > 0) {
+                if (channelNum == 0 || channelNum > numChannels) {
+                    channelNum = LoRaPresets::getDefaultSlot(loraConfig.region, loraConfig.modem_preset, effectivePrimaryChannelName());
+                }
+                frequency = LoRaPresets::getRadioFreq(loraConfig.region, loraConfig.modem_preset, channelNum) +
+                            loraConfig.frequency_offset;
+                if (!tryGetPresetRadioParameters(loraConfig.modem_preset, bandwidthKhz, spreadFactor, codingRate)) {
+                    bandwidthKhz = LoRaPresets::getBandwidth(loraConfig.modem_preset) * 1000.0f;
+                }
+            }
+        } else {
+            frequency = loraConfig.override_frequency + loraConfig.frequency_offset;
+            bandwidthKhz = loraConfig.bandwidth > 0 ? loraConfig.bandwidth : kDefaultBandwidthKhz;
+            spreadFactor = loraConfig.spread_factor > 0 ? loraConfig.spread_factor : kDefaultSpreadFactor;
+            codingRate = loraConfig.coding_rate > 0 ? loraConfig.coding_rate : kDefaultCodingRate;
+        }
+    }
+
+    void logLoRaConfigSummary(const char *reason) const
+    {
+        float frequency = 0.0f;
+        float bandwidthKhz = 0.0f;
+        uint8_t spreadFactor = 0;
+        uint8_t codingRate = 0;
+        uint32_t channelNum = 0;
+        computeActiveRadioParameters(frequency, bandwidthKhz, spreadFactor, codingRate, channelNum);
+
+        const ExpandedChannelKey key = expandedPrimaryKey();
+        const int8_t effectiveTxPower = effectiveTxPowerDbm();
+        ILOG_INFO(
+            "LoRa %s: region=%u usePreset=%u preset=%u(%s) channel=%lu freq=%.4fMHz bw=%.1fkHz sf=%u cr=%u txPower=%d sync=0x%02x hop=%u txEnabled=%u offset=%.4f name='%s' keyLen=%u keyHash=0x%02x airHash=0x%02x",
+            reason, loraConfig.region, loraConfig.use_preset ? 1 : 0, loraConfig.modem_preset,
+            LoRaPresets::modemPresetToString(loraConfig.modem_preset), static_cast<unsigned long>(channelNum), frequency,
+            bandwidthKhz, spreadFactor, codingRate, effectiveTxPower,
+            kDefaultSyncWord, loraConfig.hop_limit, loraConfig.tx_enabled ? 1 : 0, loraConfig.frequency_offset,
+            effectivePrimaryChannelName(), static_cast<unsigned>(key.length), xorHash(key.bytes, key.length),
+            currentAirChannelHash());
+    }
+
+    int8_t effectiveTxPowerDbm() const
+    {
+        const int8_t configuredTxPower = loraConfig.tx_power ? loraConfig.tx_power : kDefaultTxPowerDbm;
+        return std::min<int8_t>(configuredTxPower, kMaxTab5TxPowerDbm);
+    }
+
+    void logPacketSummary(const char *prefix, const meshtastic_MeshPacket &packet, size_t encodedLen = 0) const
+    {
+        const meshtastic_PortNum portnum =
+            packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag ? packet.decoded.portnum : meshtastic_PortNum_UNKNOWN_APP;
+        const uint32_t dataDest =
+            packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag ? packet.decoded.dest : 0;
+        const uint32_t dataSource =
+            packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag ? packet.decoded.source : 0;
+        ILOG_INFO(
+            "%s pkt: id=0x%08lx from=0x%08lx to=0x%08lx port=%u(%s) wantAck=%u hopLimit=%u hopStart=%u nextHop=0x%02x relay=0x%02x dataDest=0x%08lx dataSource=0x%08lx payload=%u encoded=%u",
+            prefix, static_cast<unsigned long>(packet.id), static_cast<unsigned long>(packet.from),
+            static_cast<unsigned long>(packet.to), static_cast<unsigned>(portnum), portNumName(portnum), packet.want_ack ? 1 : 0,
+            packet.hop_limit, packet.hop_start, packet.next_hop, packet.relay_node,
+            static_cast<unsigned long>(dataDest), static_cast<unsigned long>(dataSource),
+            packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag ? static_cast<unsigned>(packet.decoded.payload.size) : 0,
+            static_cast<unsigned>(encodedLen));
+    }
+
+    void logRawAirHeader(const char *prefix, const PacketHeader &header, size_t payloadLen, int state, float snr, int32_t rssi) const
+    {
+        ILOG_INFO(
+            "%s air: state=%d len=%u from=0x%08lx to=0x%08lx id=0x%08lx flags=0x%02x chHash=0x%02x nextHop=0x%02x relay=0x%02x rssi=%ld snr=%.1f expectedHash=0x%02x learned=%s0x%02x",
+            prefix, state, static_cast<unsigned>(payloadLen), static_cast<unsigned long>(header.from),
+            static_cast<unsigned long>(header.to), static_cast<unsigned long>(header.id), header.flags, header.channel,
+            header.next_hop, header.relay_node, static_cast<long>(rssi), snr, primaryChannelHash(),
+            hasLearnedChannelHash ? "" : "n/a ", learnedChannelHash);
+    }
+
     bool encodePacketForAir(const meshtastic_MeshPacket &packet, uint8_t *out, size_t &outLen)
     {
         if (packet.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
@@ -513,13 +817,27 @@ class Tab5LocalNodeImpl
             return false;
         }
 
-        uint8_t encrypted[kMaxAirPayload] = {0};
-        const size_t payloadLen = pb_encode_to_bytes(encrypted, sizeof(encrypted), &meshtastic_Data_msg, &packet.decoded);
+                // Meshtastic text traffic mirrors packet.to into Data.dest, including
+                // broadcast 0xffffffff. Keep source unset for local TX to match upstream.
+        meshtastic_Data encodedData = packet.decoded;
+        if (encodedData.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && encodedData.dest == 0) {
+            encodedData.dest = packet.to;
+        }
+        if (encodedData.has_bitfield && encodedData.bitfield == 0) {
+            encodedData.has_bitfield = false;
+        }
+        uint8_t plainData[kMaxAirPayload] = {0};
+        const size_t payloadLen = pb_encode_to_bytes(plainData, sizeof(plainData), &meshtastic_Data_msg, &encodedData);
         if (payloadLen == 0) {
             return false;
         }
 
-        if (!cryptAesCtr(key.bytes, key.length, packet.from, packet.id, encrypted, payloadLen)) {
+        uint8_t encrypted[kMaxAirPayload] = {0};
+        std::memcpy(encrypted, plainData, payloadLen);
+
+        const uint32_t airPacketId = packet.id;
+
+        if (!cryptAesCtr(key.bytes, key.length, packet.from, airPacketId, encrypted, payloadLen)) {
             ILOG_WARN("Failed to encrypt MeshPacket payload");
             return false;
         }
@@ -527,7 +845,7 @@ class Tab5LocalNodeImpl
         PacketHeader header{};
         header.to = packet.to;
         header.from = packet.from;
-        header.id = packet.id;
+        header.id = airPacketId;
 
         uint8_t hopLimit = packet.hop_limit ? packet.hop_limit : loraConfig.hop_limit;
         if (hopLimit > 7) {
@@ -535,12 +853,15 @@ class Tab5LocalNodeImpl
         }
 
         uint8_t hopStart = packet.hop_start ? packet.hop_start : hopLimit;
+        if (hopStart > 7) {
+            hopStart = hopLimit;
+        }
         header.flags = hopLimit | (packet.want_ack ? kPacketFlagsWantAckMask : 0) |
                        (packet.via_mqtt ? kPacketFlagsViaMqttMask : 0) |
                        static_cast<uint8_t>((hopStart << kPacketFlagsHopStartShift) & kPacketFlagsHopStartMask);
         header.channel = currentAirChannelHash();
-        header.next_hop = hopStart == 0 ? 0 : packet.next_hop;
-        header.relay_node = hopStart == 0 ? 0 : static_cast<uint8_t>(packet.from & 0xFF);
+        header.next_hop = packet.next_hop;
+        header.relay_node = packet.relay_node ? packet.relay_node : static_cast<uint8_t>(packet.from & 0xFF);
 
         outLen = sizeof(header) + payloadLen;
         std::memcpy(out, &header, sizeof(header));
@@ -605,6 +926,11 @@ class Tab5LocalNodeImpl
         if (!pb_decode_from_bytes(decodedBytes, encryptedLen, &meshtastic_Data_msg, &packet.decoded)) {
             ILOG_WARN("Drop air packet: protobuf decode failed (len=%u)", static_cast<unsigned>(encryptedLen));
             return false;
+        }
+
+        if (packet.decoded.has_bitfield) {
+            packet.decoded.want_response = packet.decoded.want_response ||
+                                           ((packet.decoded.bitfield & kBitfieldWantResponseMask) != 0);
         }
 
         if (!hashMatches) {
@@ -777,6 +1103,10 @@ class Tab5LocalNodeImpl
             primary.settings.psk.bytes[0] = 1;
         }
         if (std::strcmp(primary.settings.name, kPrimaryChannelName) == 0) {
+            primary.settings.name[0] = '\0';
+        }
+        if (loraConfig.use_preset &&
+            std::strcmp(primary.settings.name, LoRaPresets::modemPresetToString(loraConfig.modem_preset)) == 0) {
             primary.settings.name[0] = '\0';
         }
 
@@ -981,13 +1311,23 @@ class Tab5LocalNodeImpl
             packet.id = nextMeshPacketId++;
         }
 
+        if (packet.to == UINT32_MAX || packet.to == 0) {
+            packet.want_ack = false;
+        }
+
         if (packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
             packet.decoded.portnum == meshtastic_PortNum_ADMIN_APP &&
             (packet.to == 0 || packet.to == localNodeNum())) {
+            logPacketSummary("LOCAL-ADMIN", packet);
             handleAdminPacket(packet);
             return;
         }
 
+        if (packet.want_ack && packet.to != 0 && packet.to != UINT32_MAX && packet.to != localNodeNum()) {
+            queueReliablePacket(packet);
+        }
+
+        maybeBroadcastNodeInfoBeforeText(packet);
         transmitMeshPacket(packet);
     }
 
@@ -1242,6 +1582,67 @@ class Tab5LocalNodeImpl
         queueFromRadio(from);
     }
 
+    void maybeBroadcastLocalNodeInfo()
+    {
+        const uint32_t intervalSecs = deviceConfig.node_info_broadcast_secs;
+        if (intervalSecs == 0) {
+            return;
+        }
+
+        const uint32_t nowMs = millis();
+        const uint32_t intervalMs = intervalSecs * 1000UL;
+        if (lastNodeInfoBroadcastMs != 0 && (nowMs - lastNodeInfoBroadcastMs) < intervalMs) {
+            return;
+        }
+
+        broadcastLocalNodeInfo("periodic");
+    }
+
+    void maybeBroadcastNodeInfoBeforeText(const meshtastic_MeshPacket &packet)
+    {
+        if (packet.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+            packet.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP) {
+            return;
+        }
+
+        const uint32_t nowMs = millis();
+        if (lastNodeInfoBroadcastMs != 0 &&
+            (nowMs - lastNodeInfoBroadcastMs) < kInteractiveNodeInfoMinIntervalMs) {
+            return;
+        }
+
+        ILOG_INFO("Broadcast NODEINFO before TEXT: textId=0x%08lx", static_cast<unsigned long>(packet.id));
+        broadcastLocalNodeInfo("pre-text");
+    }
+
+    void broadcastLocalNodeInfo(const char *reason)
+    {
+        meshtastic_User userPayload = localUser;
+        buildNodeId(userPayload.id, sizeof(userPayload.id));
+
+        scratchTxPacket = meshtastic_MeshPacket_init_default;
+        scratchTxPacket.from = localNodeNum();
+        scratchTxPacket.to = UINT32_MAX;
+        scratchTxPacket.id = nextMeshPacketId++;
+        scratchTxPacket.want_ack = false;
+        scratchTxPacket.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+        scratchTxPacket.decoded = meshtastic_Data_init_default;
+        scratchTxPacket.decoded.portnum = meshtastic_PortNum_NODEINFO_APP;
+
+        const size_t payloadLen =
+            pb_encode_to_bytes(scratchTxPacket.decoded.payload.bytes, sizeof(scratchTxPacket.decoded.payload.bytes),
+                               &meshtastic_User_msg, &userPayload);
+        if (payloadLen == 0) {
+            ILOG_WARN("NODEINFO encode failed");
+            return;
+        }
+
+        scratchTxPacket.decoded.payload.size = payloadLen;
+        ILOG_INFO("Broadcast NODEINFO (%s): id=0x%08lx", reason, static_cast<unsigned long>(scratchTxPacket.id));
+        transmitMeshPacket(scratchTxPacket);
+        lastNodeInfoBroadcastMs = millis();
+    }
+
     void sendMetadata()
     {
         auto &from = prepareFromRadio(meshtastic_FromRadio_metadata_tag);
@@ -1346,31 +1747,197 @@ class Tab5LocalNodeImpl
         packetServer->sendPacket(DataPacket<meshtastic_FromRadio>(from.id, from));
     }
 
-    void sendLocalRoutingAck(const meshtastic_MeshPacket &original)
+    bool shouldSendRoutingAck(const meshtastic_MeshPacket &packet) const
+    {
+        if (!packet.want_ack || packet.from == 0 || packet.from == localNodeNum()) {
+            return false;
+        }
+
+        return packet.to == localNodeNum() || packet.to == UINT32_MAX || packet.to == 0;
+    }
+
+    void sendRoutingAck(const meshtastic_MeshPacket &request, meshtastic_Routing_Error error = meshtastic_Routing_Error_NONE)
     {
         meshtastic_Routing routing = meshtastic_Routing_init_default;
         routing.which_variant = meshtastic_Routing_error_reason_tag;
-        routing.error_reason = meshtastic_Routing_Error_NONE;
+        routing.error_reason = error;
 
-        uint8_t routingPayload[32] = {0};
-        const size_t routingPayloadLen = pb_encode_to_bytes(routingPayload, sizeof(routingPayload), &meshtastic_Routing_msg, &routing);
-        if (routingPayloadLen == 0) {
+        scratchTxPacket = meshtastic_MeshPacket_init_default;
+        scratchTxPacket.from = localNodeNum();
+        scratchTxPacket.to = request.from;
+        scratchTxPacket.channel = request.channel;
+        scratchTxPacket.id = nextMeshPacketId++;
+        scratchTxPacket.want_ack = false;
+        scratchTxPacket.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+        scratchTxPacket.decoded = meshtastic_Data_init_default;
+        scratchTxPacket.decoded.portnum = meshtastic_PortNum_ROUTING_APP;
+        scratchTxPacket.decoded.request_id = request.id;
+        scratchTxPacket.decoded.dest = request.from;
+        scratchTxPacket.decoded.source = localNodeNum();
+
+        const size_t encoded =
+            pb_encode_to_bytes(scratchTxPacket.decoded.payload.bytes, sizeof(scratchTxPacket.decoded.payload.bytes),
+                               &meshtastic_Routing_msg, &routing);
+        if (encoded == 0) {
+            ILOG_WARN("Routing ACK encode failed for request 0x%08lx", static_cast<unsigned long>(request.id));
             return;
         }
 
-        meshtastic_MeshPacket ackPacket = meshtastic_MeshPacket_init_default;
-        ackPacket.from = localNodeNum();
-        ackPacket.to = localNodeNum();
-        ackPacket.channel = original.channel;
-        ackPacket.id = nextMeshPacketId++;
-        ackPacket.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-        ackPacket.decoded = meshtastic_Data_init_default;
-        ackPacket.decoded.portnum = meshtastic_PortNum_ROUTING_APP;
-        ackPacket.decoded.request_id = original.id;
-        ackPacket.decoded.payload.size = static_cast<pb_size_t>(routingPayloadLen);
-        std::memcpy(ackPacket.decoded.payload.bytes, routingPayload, routingPayloadLen);
+        scratchTxPacket.decoded.payload.size = encoded;
+        logPacketSummary("TX-ACK", scratchTxPacket);
+        transmitMeshPacket(scratchTxPacket);
+    }
 
-        queueMeshPacket(ackPacket);
+    void queueReliablePacket(const meshtastic_MeshPacket &packet)
+    {
+        for (auto &pending : pendingAckTxPackets) {
+            if (pending.packet.id == packet.id && pending.packet.to == packet.to) {
+                pending.packet = packet;
+                pending.retriesDone = 0;
+                pending.lastSendMs = millis();
+                return;
+            }
+        }
+
+        PendingAckTx pending;
+        pending.packet = packet;
+        pending.retriesDone = 0;
+        pending.lastSendMs = millis();
+        pendingAckTxPackets.push_back(pending);
+    }
+
+    bool isRoutingAckForPending(const meshtastic_MeshPacket &packet)
+    {
+        if (packet.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+            return false;
+        }
+        if (packet.decoded.portnum != meshtastic_PortNum_ROUTING_APP) {
+            return false;
+        }
+        if (packet.decoded.request_id == 0) {
+            return false;
+        }
+
+        const uint32_t requestId = packet.decoded.request_id;
+        const uint32_t ackFrom = packet.from;
+        for (auto it = pendingAckTxPackets.begin(); it != pendingAckTxPackets.end(); ++it) {
+            if (it->packet.id == requestId && it->packet.to == ackFrom) {
+                ILOG_INFO("Reliable TX acked: id=0x%08lx to=0x%08lx retries=%u", static_cast<unsigned long>(requestId),
+                          static_cast<unsigned long>(ackFrom), static_cast<unsigned>(it->retriesDone));
+                pendingAckTxPackets.erase(it);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void processPendingAckRetries()
+    {
+        if (pendingAckTxPackets.empty()) {
+            return;
+        }
+
+        const uint32_t nowMs = millis();
+        for (auto it = pendingAckTxPackets.begin(); it != pendingAckTxPackets.end();) {
+            if ((nowMs - it->lastSendMs) < kReliableRetryIntervalMs) {
+                ++it;
+                continue;
+            }
+
+            if (it->retriesDone >= kReliableMaxRetries) {
+                ILOG_WARN("Reliable TX timeout: id=0x%08lx to=0x%08lx retries=%u", static_cast<unsigned long>(it->packet.id),
+                          static_cast<unsigned long>(it->packet.to), static_cast<unsigned>(it->retriesDone));
+                it = pendingAckTxPackets.erase(it);
+                continue;
+            }
+
+            ++it->retriesDone;
+            it->lastSendMs = nowMs;
+            ILOG_INFO("Reliable TX retry %u/%u: id=0x%08lx to=0x%08lx", static_cast<unsigned>(it->retriesDone),
+                      static_cast<unsigned>(kReliableMaxRetries), static_cast<unsigned long>(it->packet.id),
+                      static_cast<unsigned long>(it->packet.to));
+            transmitMeshPacket(it->packet);
+            ++it;
+        }
+    }
+
+    bool transmitBuffer(const char *tag, const uint8_t *data, size_t len, bool useDio2AutoSwitch)
+    {
+        gRadioTxDonePending = false;
+        radio.clearPacketSentAction();
+        radio.setPacketSentAction(onRadioTransmitDone);
+
+        int state = radio.startTransmit(data, len);
+        if (state != RADIOLIB_ERR_NONE) {
+            radio.clearPacketSentAction();
+            ILOG_WARN("SX1262 startTransmit failed path=%s tag=%s: %d", useDio2AutoSwitch ? "auto" : "manual",
+                      tag ? tag : "tx", state);
+            return false;
+        }
+
+        const uint32_t timeoutMs = 5 + static_cast<uint32_t>((radio.getTimeOnAir(len) * 5) / 1000);
+        const uint32_t startMs = millis();
+        while (!gRadioTxDonePending) {
+            delay(1);
+            if ((millis() - startMs) > timeoutMs) {
+                radio.clearPacketSentAction();
+                radio.finishTransmit();
+                ILOG_WARN("SX1262 tx timeout path=%s tag=%s after %lu ms", useDio2AutoSwitch ? "auto" : "manual",
+                          tag ? tag : "tx", static_cast<unsigned long>(timeoutMs));
+                return false;
+            }
+        }
+
+        state = radio.finishTransmit();
+        radio.clearPacketSentAction();
+        if (state != RADIOLIB_ERR_NONE) {
+            ILOG_WARN("SX1262 finishTransmit failed path=%s tag=%s: %d", useDio2AutoSwitch ? "auto" : "manual",
+                      tag ? tag : "tx", state);
+            return false;
+        }
+
+        return true;
+    }
+
+    const char *rfPathModeName(RfPathMode mode) const
+    {
+        switch (mode) {
+        case RfPathMode::AutoHigh:
+            return "auto-rf";
+        case RfPathMode::ManualHigh:
+            return "manual-high";
+        case RfPathMode::ManualLow:
+            return "manual-low";
+        }
+
+        return "unknown";
+    }
+
+    void applyTxRfPathMode(RfPathMode mode)
+    {
+        switch (mode) {
+        case RfPathMode::AutoHigh:
+            radio.setDio2AsRfSwitch(true);
+            digitalWrite(kLoRaRfSwitch, HIGH);
+            break;
+        case RfPathMode::ManualHigh:
+            radio.setDio2AsRfSwitch(false);
+            digitalWrite(kLoRaRfSwitch, HIGH);
+            break;
+        case RfPathMode::ManualLow:
+            radio.setDio2AsRfSwitch(false);
+            digitalWrite(kLoRaRfSwitch, LOW);
+            break;
+        }
+    }
+
+    bool transmitBufferWithRfMode(const char *tag, const uint8_t *data, size_t len, RfPathMode mode)
+    {
+        applyTxRfPathMode(mode);
+        delayMicroseconds(200);
+
+        return transmitBuffer(tag, data, len, mode == RfPathMode::AutoHigh);
     }
 
     void transmitMeshPacket(const meshtastic_MeshPacket &packet)
@@ -1383,14 +1950,76 @@ class Tab5LocalNodeImpl
         }
 
         gRadioRxPending = false;
+        gRadioTxDonePending = false;
         radio.clearPacketReceivedAction();
-        int state = radio.transmit(payload, encoded);
-        if (state != RADIOLIB_ERR_NONE) {
-            ILOG_WARN("SX1262 transmit failed: %d", state);
+        radio.clearPacketSentAction();
+        logLoRaConfigSummary("TX");
+
+        const bool primaryPathAuto = kPrimaryRfUsesDio2AutoSwitch;
+        const bool fallbackPathEnabled = kEnableDualRfSwitchTxProbe && (kFallbackRfUsesDio2AutoSwitch != kPrimaryRfUsesDio2AutoSwitch);
+        bool primaryOk = false;
+        if (kEnableRfPathSweepTx) {
+            primaryOk = transmitBufferWithRfMode("primary-auto", payload, encoded, RfPathMode::AutoHigh);
+            transmitBufferWithRfMode("primary-manual-high", payload, encoded, RfPathMode::ManualHigh);
+            transmitBufferWithRfMode("primary-manual-low", payload, encoded, RfPathMode::ManualLow);
         } else {
-            sendLocalRoutingAck(packet);
+            primaryOk = transmitBuffer("primary", payload, encoded, primaryPathAuto);
         }
-        state = radio.startReceive();
+
+        if (kEnableAltHashCompatTx && primaryOk && packet.to == UINT32_MAX && encoded >= sizeof(PacketHeader)) {
+            const uint8_t primaryHash = primaryChannelHash();
+            uint8_t altHash = 0;
+            bool shouldSendAltHash = false;
+            if (hasLearnedChannelHash && learnedChannelHash != primaryHash) {
+                altHash = learnedChannelHash;
+                shouldSendAltHash = true;
+            } else {
+                const uint8_t legacyHash = legacyPresetNameChannelHash();
+                if (legacyHash != primaryHash) {
+                    altHash = legacyHash;
+                    shouldSendAltHash = true;
+                }
+            }
+
+            if (shouldSendAltHash) {
+                PacketHeader altHeader{};
+                std::memcpy(&altHeader, payload, sizeof(altHeader));
+                altHeader.channel = altHash;
+
+                uint8_t altPayload[255] = {0};
+                std::memcpy(altPayload, payload, encoded);
+                std::memcpy(altPayload, &altHeader, sizeof(altHeader));
+
+                transmitBuffer("alt-hash", altPayload, encoded, primaryPathAuto);
+                if (fallbackPathEnabled) {
+                    transmitBuffer("fallback-primary", payload, encoded, kFallbackRfUsesDio2AutoSwitch);
+                    transmitBuffer("fallback-alt-hash", altPayload, encoded, kFallbackRfUsesDio2AutoSwitch);
+                }
+            }
+        } else if (fallbackPathEnabled) {
+            transmitBuffer("fallback-primary", payload, encoded, kFallbackRfUsesDio2AutoSwitch);
+        }
+
+        if (kEnableRawTxProbe &&
+            packet.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+            packet.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+            char probe[48] = {0};
+            std::snprintf(probe, sizeof(probe), "TAB5-PROBE-%08lX", static_cast<unsigned long>(packet.id));
+            const uint8_t *probeBytes = reinterpret_cast<const uint8_t *>(probe);
+            const size_t probeLen = std::strlen(probe);
+            if (transmitBuffer("raw-probe", probeBytes, probeLen, primaryPathAuto)) {
+                ILOG_INFO("SX1262 raw probe transmit ok path=%s: '%s'", primaryPathAuto ? "auto" : "manual", probe);
+            }
+            if (fallbackPathEnabled) {
+                if (transmitBuffer("fallback-raw-probe", probeBytes, probeLen, kFallbackRfUsesDio2AutoSwitch)) {
+                    ILOG_INFO("SX1262 raw probe transmit ok path=%s: '%s'",
+                              kFallbackRfUsesDio2AutoSwitch ? "auto" : "manual", probe);
+                }
+            }
+        }
+
+        applyRfStrategy(kPrimaryRfUsesDio2AutoSwitch, false);
+        const int state = radio.startReceive();
         radio.setPacketReceivedAction(onRadioReceive);
         gRadioRxPending = false;
         if (state != RADIOLIB_ERR_NONE) {
@@ -1411,15 +2040,30 @@ class Tab5LocalNodeImpl
         int state = radio.readData(payload, packetLength);
         float snr = radio.getSNR();
         int32_t rssi = lround(radio.getRSSI());
+        ILOG_INFO("SX1262 rx event: state=%d len=%u rssi=%ld snr=%.1f", state, static_cast<unsigned>(packetLength),
+                  static_cast<long>(rssi), snr);
 
         if (state == RADIOLIB_ERR_NONE) {
             if (decodePacketFromAir(payload, packetLength, snr, rssi, scratchRxPacket)) {
-                updateKnownNode(scratchRxPacket.from, snr);
-                queueMeshPacket(scratchRxPacket);
+                isRoutingAckForPending(scratchRxPacket);
+                if (shouldSendRoutingAck(scratchRxPacket)) {
+                    sendRoutingAck(scratchRxPacket);
+                }
+                if (isDuplicateAirPacket(scratchRxPacket)) {
+                    ILOG_INFO("Drop duplicate air packet: from=0x%08lx id=0x%08lx", static_cast<unsigned long>(scratchRxPacket.from),
+                              static_cast<unsigned long>(scratchRxPacket.id));
+                } else {
+                    rememberAirPacket(scratchRxPacket);
+                    updateKnownNode(scratchRxPacket.from, snr);
+                    queueMeshPacket(scratchRxPacket);
+                }
             } else {
                 ILOG_WARN("Meshtastic air decode failed");
             }
-        } else if (state != RADIOLIB_ERR_CRC_MISMATCH) {
+        } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+            ILOG_WARN("SX1262 CRC mismatch: len=%u rssi=%ld snr=%.1f", static_cast<unsigned>(packetLength),
+                      static_cast<long>(rssi), snr);
+        } else {
             ILOG_WARN("SX1262 receive failed: %d", state);
         }
 
@@ -1437,9 +2081,11 @@ class Tab5LocalNodeImpl
             KnownNode node;
             node.num = nodeNum;
             node.user = meshtastic_User_init_default;
-            std::snprintf(node.user.id, sizeof(node.user.id), "!%08lx", static_cast<unsigned long>(nodeNum));
-            std::snprintf(node.user.long_name, sizeof(node.user.long_name), "Node %08lx", static_cast<unsigned long>(nodeNum));
-            std::snprintf(node.user.short_name, sizeof(node.user.short_name), "%02lX", static_cast<unsigned long>(nodeNum & 0xFF));
+            std::snprintf(node.user.id, sizeof(node.user.id), "!%08lX", static_cast<unsigned long>(nodeNum));
+            std::snprintf(node.user.long_name, sizeof(node.user.long_name), "Node %04lX",
+                          static_cast<unsigned long>(nodeNum & 0xFFFF));
+            std::snprintf(node.user.short_name, sizeof(node.user.short_name), "%04lX",
+                          static_cast<unsigned long>(nodeNum & 0xFFFF));
             node.user.hw_model = meshtastic_HardwareModel_UNSET;
             node.user.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
             node.lastHeard = millis() / 1000;
@@ -1451,6 +2097,50 @@ class Tab5LocalNodeImpl
 
         it->lastHeard = millis() / 1000;
         it->snr = snr;
+    }
+
+    bool isDuplicateAirPacket(const meshtastic_MeshPacket &packet)
+    {
+        const uint32_t nowMs = millis();
+        constexpr uint32_t kDuplicateWindowMs = 30000;
+
+        for (auto it = recentAirPackets.begin(); it != recentAirPackets.end();) {
+            if (nowMs - it->seenAtMs > kDuplicateWindowMs) {
+                it = recentAirPackets.erase(it);
+                continue;
+            }
+
+            if (it->from == packet.from && it->id == packet.id) {
+                return true;
+            }
+
+            ++it;
+        }
+
+        return false;
+    }
+
+    void applyRfStrategy(bool useDio2AutoSwitch, bool txPhase)
+    {
+        radio.setDio2AsRfSwitch(useDio2AutoSwitch);
+        if (useDio2AutoSwitch) {
+            // Sample-code compatible mode: external RF switch power held high.
+            digitalWrite(kLoRaRfSwitch, HIGH);
+        } else {
+            // Manual GPIO mode: explicit TX/RX levels for board-level RF switch.
+            digitalWrite(kLoRaRfSwitch, txPhase ? kRfSwitchTxLevel : kRfSwitchRxLevel);
+        }
+    }
+
+    void rememberAirPacket(const meshtastic_MeshPacket &packet)
+    {
+        const uint32_t nowMs = millis();
+        constexpr size_t kRecentAirPacketLimit = 32;
+
+        recentAirPackets.push_back({packet.from, packet.id, nowMs});
+        if (recentAirPackets.size() > kRecentAirPacketLimit) {
+            recentAirPackets.erase(recentAirPackets.begin(), recentAirPackets.begin() + (recentAirPackets.size() - kRecentAirPacketLimit));
+        }
     }
 
     void updateSelfNode()
@@ -1468,6 +2158,7 @@ class Tab5LocalNodeImpl
             return;
         }
 
+        applyRfStrategy(kPrimaryRfUsesDio2AutoSwitch, false);
         gRadioRxPending = false;
         int state = radio.standby();
         if (state != RADIOLIB_ERR_NONE) {
@@ -1486,19 +2177,12 @@ class Tab5LocalNodeImpl
                           loraConfig.modem_preset);
                 return;
             }
-            uint32_t channelNum = effectiveChannelNum();
-            if (channelNum == 0 || channelNum > numChannels) {
-                channelNum = LoRaPresets::getDefaultSlot(loraConfig.region, loraConfig.modem_preset, effectivePrimaryChannelName());
-            }
+        }
+
+        uint32_t channelNum = 0;
+        computeActiveRadioParameters(frequency, bandwidthKhz, spreadFactor, codingRate, channelNum);
+        if (loraConfig.use_preset && channelNum > 0) {
             loraConfig.channel_num = channelNum;
-            frequency = LoRaPresets::getRadioFreq(loraConfig.region, loraConfig.modem_preset, channelNum) +
-                        loraConfig.frequency_offset;
-            bandwidthKhz = LoRaPresets::getBandwidth(loraConfig.modem_preset) * 1000.0f;
-        } else {
-            frequency = loraConfig.override_frequency + loraConfig.frequency_offset;
-            bandwidthKhz = loraConfig.bandwidth > 0 ? loraConfig.bandwidth : kDefaultBandwidthKhz;
-            spreadFactor = loraConfig.spread_factor > 0 ? loraConfig.spread_factor : kDefaultSpreadFactor;
-            codingRate = loraConfig.coding_rate > 0 ? loraConfig.coding_rate : kDefaultCodingRate;
         }
 
         if ((state = radio.setFrequency(frequency)) != RADIOLIB_ERR_NONE) {
@@ -1513,16 +2197,15 @@ class Tab5LocalNodeImpl
         if ((state = radio.setCodingRate(codingRate)) != RADIOLIB_ERR_NONE) {
             ILOG_WARN("SX1262 setCodingRate failed: %d", state);
         }
-        if ((state = radio.setOutputPower(loraConfig.tx_power ? loraConfig.tx_power : kDefaultTxPowerDbm)) !=
-            RADIOLIB_ERR_NONE) {
-            ILOG_WARN("SX1262 setOutputPower failed: %d", state);
+        if (!applyPacketLayerDefaults(radio, effectiveTxPowerDbm())) {
+            ILOG_WARN("SX1262 packet layer reconfigure incomplete");
         }
-        if ((state = radio.setSyncWord(kDefaultSyncWord)) != RADIOLIB_ERR_NONE) {
-            ILOG_WARN("SX1262 setSyncWord failed: %d", state);
-        }
+
+        applyRfStrategy(kPrimaryRfUsesDio2AutoSwitch, false);
 
         hasLearnedChannelHash = false;
         learnedChannelHash = 0;
+        logLoRaConfigSummary("apply");
 
         state = radio.startReceive();
         if (state != RADIOLIB_ERR_NONE) {
@@ -1597,6 +2280,9 @@ class Tab5LocalNodeImpl
     meshtastic_ModuleConfig cannedMessageConfig = meshtastic_ModuleConfig_init_default;
     meshtastic_DeviceConnectionStatus connectionStatus = meshtastic_DeviceConnectionStatus_init_default;
     std::vector<KnownNode> knownNodes;
+    std::vector<RecentAirPacket> recentAirPackets;
+    std::vector<PendingAckTx> pendingAckTxPackets;
+    uint32_t lastNodeInfoBroadcastMs = 0;
     bool hasLearnedChannelHash = false;
     uint8_t learnedChannelHash = 0;
     char currentRingtone[231] = {0};
