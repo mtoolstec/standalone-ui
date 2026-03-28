@@ -65,8 +65,10 @@ constexpr char kStateFilePath[] = "/tab5-node-state.bin";
 constexpr char kMessagesDirPath[] = "/messages";
 constexpr uint32_t kStateMagic = 0x54354C53;
 constexpr uint16_t kStateVersionV1 = 1;
-constexpr uint16_t kStateVersion = 2;
+constexpr uint16_t kStateVersionV2 = 2;
+constexpr uint16_t kStateVersion = 3;
 constexpr size_t kMaxChannels = 8;
+constexpr size_t kMaxPersistedKnownNodes = 64;
 constexpr uint8_t kDefaultPsk[16] = {0xD4, 0xF1, 0xBB, 0x3A, 0x20, 0x29, 0x07, 0x59,
                                      0xF0, 0xBC, 0xFF, 0xAB, 0xCF, 0x4E, 0x69, 0x01};
 
@@ -309,6 +311,13 @@ struct PersistedStateHeader {
     uint16_t reserved = 0;
 };
 
+struct PersistedKnownNode {
+    uint32_t num = 0;
+    meshtastic_User user = meshtastic_User_init_default;
+    uint32_t lastHeard = 0;
+    float snr = 0.0f;
+};
+
 struct PersistedState {
     PersistedStateHeader header;
     meshtastic_User localUser = meshtastic_User_init_default;
@@ -325,6 +334,9 @@ struct PersistedState {
     meshtastic_ModuleConfig telemetryConfig = meshtastic_ModuleConfig_init_default;
     meshtastic_ModuleConfig cannedMessageConfig = meshtastic_ModuleConfig_init_default;
     char currentRingtone[231] = {0};
+    uint16_t knownNodeCount = 0;
+    uint16_t knownNodeReserved = 0;
+    PersistedKnownNode knownNodes[kMaxPersistedKnownNodes] = {};
 };
 
 struct PersistedStateV1 {
@@ -340,6 +352,24 @@ struct PersistedStateV1 {
     meshtastic_Config_BluetoothConfig bluetoothConfig = meshtastic_Config_BluetoothConfig_init_default;
     meshtastic_Config_SecurityConfig securityConfig = meshtastic_Config_SecurityConfig_init_default;
     meshtastic_Channel primaryChannel = meshtastic_Channel_init_default;
+    meshtastic_ModuleConfig telemetryConfig = meshtastic_ModuleConfig_init_default;
+    meshtastic_ModuleConfig cannedMessageConfig = meshtastic_ModuleConfig_init_default;
+    char currentRingtone[231] = {0};
+};
+
+struct PersistedStateV2 {
+    PersistedStateHeader header;
+    meshtastic_User localUser = meshtastic_User_init_default;
+    meshtastic_DeviceUIConfig deviceUiConfig = meshtastic_DeviceUIConfig_init_default;
+    meshtastic_Config_DeviceConfig deviceConfig = meshtastic_Config_DeviceConfig_init_default;
+    meshtastic_Config_PositionConfig positionConfig = meshtastic_Config_PositionConfig_init_default;
+    meshtastic_Config_PowerConfig powerConfig = meshtastic_Config_PowerConfig_init_default;
+    meshtastic_Config_NetworkConfig networkConfig = meshtastic_Config_NetworkConfig_init_default;
+    meshtastic_Config_DisplayConfig displayConfig = meshtastic_Config_DisplayConfig_init_default;
+    meshtastic_Config_LoRaConfig loraConfig = meshtastic_Config_LoRaConfig_init_default;
+    meshtastic_Config_BluetoothConfig bluetoothConfig = meshtastic_Config_BluetoothConfig_init_default;
+    meshtastic_Config_SecurityConfig securityConfig = meshtastic_Config_SecurityConfig_init_default;
+    meshtastic_Channel channels[kMaxChannels] = {};
     meshtastic_ModuleConfig telemetryConfig = meshtastic_ModuleConfig_init_default;
     meshtastic_ModuleConfig cannedMessageConfig = meshtastic_ModuleConfig_init_default;
     char currentRingtone[231] = {0};
@@ -1009,9 +1039,9 @@ class Tab5LocalNodeImpl
         loraConfig = meshtastic_Config_LoRaConfig_init_default;
         loraConfig.use_preset = true;
         loraConfig.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW;
-        loraConfig.bandwidth = static_cast<uint16_t>(kDefaultBandwidthKhz);
-        loraConfig.spread_factor = kDefaultSpreadFactor;
-        loraConfig.coding_rate = kDefaultCodingRate;
+        loraConfig.bandwidth = 0;
+        loraConfig.spread_factor = 0;
+        loraConfig.coding_rate = 0;
         loraConfig.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
         loraConfig.hop_limit = 3;
         loraConfig.tx_enabled = true;
@@ -1065,6 +1095,12 @@ class Tab5LocalNodeImpl
     void normalizeState()
     {
         applyLocalUserDefaults(true);
+
+        // Keep LoRa configuration aligned with upstream preset workflow.
+        loraConfig.use_preset = true;
+        loraConfig.bandwidth = 0;
+        loraConfig.spread_factor = 0;
+        loraConfig.coding_rate = 0;
 
         if (loraConfig.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
             loraConfig.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
@@ -1186,14 +1222,53 @@ class Tab5LocalNodeImpl
 
             normalizeState();
             saveState();
-            ILOG_INFO("Migrated persisted Tab5 node state v1 -> v2");
+            ILOG_INFO("Migrated persisted Tab5 node state v1 -> v3");
+            return true;
+        }
+
+        if (header.version == kStateVersionV2) {
+            PersistedStateV2 oldState;
+            file = LittleFS.open(kStateFilePath, FILE_READ);
+            if (!file) {
+                ILOG_WARN("Failed to reopen state file for v2 migration");
+                normalizeState();
+                return false;
+            }
+            const size_t bytesRead = file.read(reinterpret_cast<uint8_t *>(&oldState), sizeof(oldState));
+            file.close();
+            if (bytesRead != sizeof(oldState)) {
+                ILOG_WARN("Ignoring truncated v2 persisted state");
+                normalizeState();
+                return false;
+            }
+
+            localUser = oldState.localUser;
+            deviceUiConfig = oldState.deviceUiConfig;
+            deviceConfig = oldState.deviceConfig;
+            positionConfig = oldState.positionConfig;
+            powerConfig = oldState.powerConfig;
+            networkConfig = oldState.networkConfig;
+            displayConfig = oldState.displayConfig;
+            loraConfig = oldState.loraConfig;
+            bluetoothConfig = oldState.bluetoothConfig;
+            securityConfig = oldState.securityConfig;
+            for (size_t i = 0; i < kMaxChannels; ++i) {
+                channels[i] = oldState.channels[i];
+            }
+            telemetryConfig = oldState.telemetryConfig;
+            cannedMessageConfig = oldState.cannedMessageConfig;
+            std::memcpy(currentRingtone, oldState.currentRingtone, sizeof(currentRingtone));
+
+            normalizeState();
+            saveState();
+            ILOG_INFO("Migrated persisted Tab5 node state v2 -> v3");
             return true;
         }
 
         PersistedState state;
         file = LittleFS.open(kStateFilePath, FILE_READ);
         if (!file) {
-            ILOG_WARN("Failed to reopen state file for v2 load");
+            ILOG_WARN("Failed to reopen state file for v3 load");
             normalizeState();
             return false;
         }
@@ -1222,6 +1297,31 @@ class Tab5LocalNodeImpl
         cannedMessageConfig = state.cannedMessageConfig;
         std::memcpy(currentRingtone, state.currentRingtone, sizeof(currentRingtone));
 
+        knownNodes.clear();
+        const size_t persistedNodes = std::min<size_t>(state.knownNodeCount, kMaxPersistedKnownNodes);
+        knownNodes.reserve(persistedNodes > 0 ? persistedNodes : 1);
+        for (size_t i = 0; i < persistedNodes; ++i) {
+            const auto &persisted = state.knownNodes[i];
+            if (persisted.num == 0) {
+                continue;
+            }
+
+            KnownNode node;
+            node.num = persisted.num;
+            node.user = persisted.user;
+            node.lastHeard = persisted.lastHeard;
+            node.snr = persisted.snr;
+            knownNodes.push_back(node);
+        }
+
+        const uint32_t selfNodeNum = localNodeNum();
+        auto selfIt = std::find_if(knownNodes.begin(), knownNodes.end(), [selfNodeNum](const KnownNode &node) {
+            return node.num == selfNodeNum;
+        });
+        if (selfIt != knownNodes.end() && selfIt != knownNodes.begin()) {
+            std::iter_swap(knownNodes.begin(), selfIt);
+        }
+
         normalizeState();
         ILOG_INFO("Loaded persisted Tab5 node state");
         return true;
@@ -1248,6 +1348,18 @@ class Tab5LocalNodeImpl
         state.telemetryConfig = telemetryConfig;
         state.cannedMessageConfig = cannedMessageConfig;
         std::memcpy(state.currentRingtone, currentRingtone, sizeof(currentRingtone));
+        state.knownNodeCount = static_cast<uint16_t>(std::min<size_t>(knownNodes.size(), kMaxPersistedKnownNodes));
+        for (size_t i = 0; i < state.knownNodeCount; ++i) {
+            state.knownNodes[i].num = knownNodes[i].num;
+            state.knownNodes[i].user = knownNodes[i].user;
+            state.knownNodes[i].lastHeard = knownNodes[i].lastHeard;
+            state.knownNodes[i].snr = knownNodes[i].snr;
+        }
+
+        if (knownNodes.size() > kMaxPersistedKnownNodes) {
+            ILOG_WARN("Known node list truncated for persistence (%u -> %u)", static_cast<unsigned>(knownNodes.size()),
+                      static_cast<unsigned>(kMaxPersistedKnownNodes));
+        }
 
         File file = LittleFS.open(kStateFilePath, "w");
         if (!file) {
@@ -1459,15 +1571,16 @@ class Tab5LocalNodeImpl
             break;
         case meshtastic_Config_lora_tag:
             loraConfig = config.payload_variant.lora;
+            loraConfig.use_preset = true;
+            loraConfig.bandwidth = 0;
+            loraConfig.spread_factor = 0;
+            loraConfig.coding_rate = 0;
             if (loraConfig.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
                 loraConfig.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
             }
-            if (loraConfig.use_preset && loraConfig.channel_num == 0) {
+            if (loraConfig.channel_num == 0) {
                 loraConfig.channel_num = LoRaPresets::getDefaultSlot(loraConfig.region, loraConfig.modem_preset,
                                                                      effectivePrimaryChannelName());
-            }
-            if (!loraConfig.use_preset && loraConfig.override_frequency == 0.0f) {
-                loraConfig.override_frequency = kDefaultFrequencyMhz;
             }
             applyLoRaConfigToRadio();
             break;
@@ -2091,6 +2204,7 @@ class Tab5LocalNodeImpl
             node.lastHeard = millis() / 1000;
             node.snr = snr;
             knownNodes.push_back(node);
+            saveState();
             sendNodeInfo(node);
             return;
         }

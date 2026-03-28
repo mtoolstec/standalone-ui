@@ -31,7 +31,7 @@ class LGFX_TAB5 : public m5gfx::M5GFX
       scale = 1;
     }
 
-    // Keep integer scaling for sharp text/icons and expand logical width to use more horizontal space.
+    // Keep integer scaling for sharp text/icons and expand logical width to use horizontal space.
     screenHeight = logicalHeight;
     screenWidth = physicalWidth / scale;
     if (screenWidth < logicalWidth) {
