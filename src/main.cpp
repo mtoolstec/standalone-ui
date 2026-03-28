@@ -8,6 +8,10 @@
 #include "comms/UARTClient.h"
 #include "graphics/DeviceScreen.h"
 
+#ifdef TAB5_MUI
+#include "Tab5LocalNode.h"
+#endif
+
 #if defined(ARCH_PORTDUINO)
 #include <thread>
 #define FSBegin() true
@@ -198,12 +202,23 @@ void setup()
     }
 
 #ifdef ARCH_ESP32
+#ifdef TAB5_MUI
+    if (!Tab5LocalNode::instance().begin()) {
+        ILOG_ERROR("Tab5 local node init failed");
+    }
+    client = &Tab5LocalNode::instance().client();
+#ifdef USE_DUMMY_SERIAL
+    (void)client;
+#endif
+    screen = &DeviceScreen::create();
+#else
 #ifdef USE_DUMMY_SERIAL
     client = new DummyClient();
 #else
     client = new UARTClient();
 #endif
     screen = &DeviceScreen::create();
+#endif
 #endif
 
     screen->init(client);
@@ -238,6 +253,9 @@ void setup()
 #if defined(ARCH_ESP32)
 void loop()
 {
+#ifdef TAB5_MUI
+    Tab5LocalNode::instance().taskHandler();
+#endif
     screen->task_handler();
     screen->sleep(5);
 }

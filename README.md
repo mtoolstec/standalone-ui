@@ -36,6 +36,7 @@ This repository provides firmware source code for the following MUI devices and 
 - LilyGo T-HMI 2.8inch TFT (esp32-s3) - serial
 - ESP32-4848S040 4.0inch TFT (esp32-s3) - serial
 - WT32-SC01 Plus 3.5inch TFT (esp32-s3) - serial
+- M5Stack Tab5 5inch TFT (esp32-p4) - serial
 - Native linux X11 local/remote application - ethernet TCP/IP or USB serial
 
 <img src="docs/T-HMI.jpg" alt="T-HMI" width="130" height="150"><img src="docs/ESP32-4848S040.jpg" alt="ESP32-4848S040" width="150" height="150"><img src="docs/WT32-SC01-Plus.jpg" alt="WT32-SC01 Plus" width="150" height="150"><img src="docs/native-mui.png" alt="Native MUI Client" width="190" height="150">
@@ -60,11 +61,16 @@ source $HOME/.platformio/bin/penv/activate
 pio run -e t-hmi-mui -t upload
 pio run -e diy-replicator-mui -t upload
 pio run -e wt32-sc01-plus-mui -t upload
+pio run -e tab5-mui -t upload
 
 # when connecting to another LoRa device its serial interface must be configured:
 meshtastic --set serial.enabled true --set serial.baud 38400 --set serial.mode PROTO
 # please configure the right GPIO serial ports for rx/tx, e.g. for RAK4631
 meshtastic --set serial.rxd 8 --set serial.txd 6
+
+# Tab5 port note:
+# the current Tab5 target is a standalone-ui client using UART1 on M-Bus pins
+# RX=GPIO38 / TX=GPIO37 to talk to a Meshtastic node configured for serial PROTO
 
 # build the native MUI
 pio run -e native-mui
